@@ -54,7 +54,7 @@ python -m pip install -r ComfyUI-llama-cpp_vlm/requirements.txt
 
 Use ComfyUI's Python interpreter. The upstream default requirements include a Linux x86_64 CUDA 12.8 JamePeng `llama-cpp-python` wheel; for CUDA 13, follow upstream's `requirements_cu131.txt` instructions. Other architectures or CPU setups need a compatible JamePeng build. This project does not install or replace your inference dependencies automatically.
 
-Both PE models use Qwen3.5, so the backend must provide **`Qwen35ChatHandler`**. Loading uses `Qwen3.5-Thinking`; format retries and translation temporarily disable thinking. Editing loads the matching mmproj with the model. GPU placement follows the upstream full-offload configuration. Existing workflows run directly; no additional upstream loader node connection is needed.
+Both PE models use Qwen3.5, so the backend must provide **`Qwen35ChatHandler`**. Text-to-image uses text-only loading (`chat_handler=None`) and the GGUF chat template, without an mmproj. Editing uses `Qwen3.5-Thinking` and loads the matching mmproj. Both paths support thinking control; format retries and translation temporarily disable thinking. GPU placement follows the upstream full-offload configuration. Existing workflows run directly; no additional upstream loader node connection is needed.
 
 Model discovery retains the node-local model directory, `ComfyUI/models/llm/qwenimage-pe/`, and `QWEN_PE_MODEL_DIR`. It also searches upstream's **`ComfyUI/models/LLM/` (case-sensitive)** and registered additional directories. Keep each main model and matching mmproj together.
 
@@ -103,6 +103,7 @@ The directory also has Heretic text-to-image, Chinese and English transparency, 
 | `ComfyUI-llama-cpp_vlm is not loaded` | Check that the plugin is installed, enabled, and imports successfully. Install upstream Linux requirements with ComfyUI's Python and restart. |
 | `Native model loading exceeded ... seconds` | The budget was exceeded when synchronous loading returned; the model was released. Check the ComfyUI console, increase `startup_timeout` for slow loading, or use `keep_loaded` for repeated calls. |
 | `Qwen35ChatHandler` unavailable | Update ComfyUI-llama-cpp_vlm and its JamePeng Linux wheel; older generic llama-cpp-python builds may lack Qwen3.5 support. |
+| Text-to-image reports `Qwen35ChatHandler(__init__): mmproj_path is required` | Update this node and restart ComfyUI. Text-to-image uses text-only loading and needs no vision projector; the older implementation incorrectly created a vision handler for a text-only model. |
 | Editing reports a missing mmproj | Put the matching I2I main model and vision file together, or choose the matching `vision_model`. |
 | `model response reached the generation or context limit` | The node retries once without thinking. If it still fails, inspect the token counts in the error, use fewer images, or shorten the instruction. Multi-image jobs use more VRAM. |
 | `model failed format validation` | Both attempts failed a JSON, ratio, language, or image-reference check. Read the error details. After a successful run, `diagnostics` can confirm the task and input-port mapping. |

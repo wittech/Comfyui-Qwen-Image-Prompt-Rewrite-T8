@@ -7,6 +7,8 @@ import types
 import unittest
 from unittest.mock import patch
 
+from jinja2.sandbox import ImmutableSandboxedEnvironment
+
 import pe_runtime
 from pe_runtime import LocalRuntime, local_models, parse_answer, vlm_module
 
@@ -18,12 +20,37 @@ class ProcessorList(list):
         return scores
 
 
+class TextFormatter:
+    """Render the supplied GGUF template using real Jinja, with no vision API."""
+
+    def __init__(self, template, eos_token, bos_token, stop_token_ids):
+        self.template = ImmutableSandboxedEnvironment().from_string(template)
+        self.eos_token = eos_token
+        self.bos_token = bos_token
+
+    def to_chat_handler(self):
+        def complete(*, llama, messages):
+            prompt = self.template.render(messages=messages, add_generation_prompt=True,
+                                          eos_token=self.eos_token, bos_token=self.bos_token)
+            llama.prompts.append(prompt)
+            return llama.result()
+        return complete
+
+
 class Model:
     def __init__(self):
         self.closed = False
         self.calls = []
         self.thinking = []
         self.penalties = []
+        self.prompts = []
+        self.chat_handler = None
+        self.metadata = {"tokenizer.chat_template": (
+            "{% for message in messages %}{{ '<|im_start|>' + message.role + '\\n' "
+            "+ message.content + eos_token + '\\n' }}{% endfor %}"
+            "{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}"
+            "{% if enable_thinking %}{{ '<think>\\n' }}"
+            "{% else %}{{ '<think>\\n\\n</think>\\n\\n' }}{% endif %}{% endif %}")}
         self.response = '{"rewritten_prompt":"A blue dog.","wh_ratio":"1:1"}'
 
     def close(self):
@@ -33,17 +60,32 @@ class Model:
         if self.closed:
             raise RuntimeError("Use after close")
 
-    # Deliberately match the native API, without HTTP-only template kwargs.
-    def create_chat_completion(self, messages, seed, stream, max_tokens,
-                               temperature, top_p, top_k, min_p,
-                               present_penalty, logits_processor):
-        logits_processor([], [])
-        self.calls.append(copy.deepcopy(messages))
-        self.thinking.append((self.handler.enable_thinking,
-                              self.handler.extra_template_arguments["enable_thinking"]))
-        self.penalties.append(present_penalty)
+    def token_eos(self):
+        return 2
+
+    def token_bos(self):
+        return -1
+
+    def detokenize(self, tokens, special=False):
+        assert tokens == [2] and special
+        return b"<|im_end|>"
+
+    def result(self):
         return {"choices": [{"message": {"content": self.response},
                              "finish_reason": "stop"}], "usage": {}}
+
+    # Deliberately match the native API, without HTTP-only template kwargs.
+    def create_chat_completion(self, messages, seed, stream, max_tokens,
+                               temperature, top_p, logits_processor, top_k=40,
+                               min_p=0.05, present_penalty=0.0):
+        logits_processor([], [])
+        self.calls.append(copy.deepcopy(messages))
+        self.penalties.append(present_penalty)
+        if callable(self.chat_handler):
+            return self.chat_handler(llama=self, messages=messages)
+        self.thinking.append((self.handler.enable_thinking,
+                              self.handler.extra_template_arguments["enable_thinking"]))
+        return self.result()
 
 
 class Storage:
@@ -61,10 +103,17 @@ class Storage:
         self.clean(all=True)
         self.current_config = config.copy()
         self.loads.append(config.copy())
-        self.chat_handler = types.SimpleNamespace(
+        # Match upstream: a named Qwen vision handler cannot be constructed
+        # without a projector. Previously this fixture accepted that bad config.
+        if (config.get("chat_handler", "None") != "None"
+                and config.get("mmproj", "None") == "None"):
+            raise ValueError("Qwen35ChatHandler(__init__): `mmproj_path` is required")
+        self.chat_handler = (types.SimpleNamespace(
             enable_thinking=True, extra_template_arguments={"enable_thinking": True})
+            if config.get("chat_handler", "None") != "None" else None)
         self.llm = Model()
         self.llm.handler = self.chat_handler
+        self.llm.chat_handler = self.chat_handler
         if self.on_load:
             self.on_load()
 
@@ -84,7 +133,9 @@ class LinuxBackendTests(unittest.TestCase):
         module = types.ModuleType("custom_nodes.renamed_vlm.nodes")
         module.LLAMA_CPP_STORAGE = self.storage
         module.Qwen35ChatHandler = object
-        module.llama_cpp = types.SimpleNamespace(LogitsProcessorList=ProcessorList)
+        module.llama_cpp = types.SimpleNamespace(
+            LogitsProcessorList=ProcessorList,
+            llama_chat_format=types.SimpleNamespace(Jinja2ChatFormatter=TextFormatter))
         loader = type("llama_cpp_model_loader", (), {"__module__": module.__name__})
         nodes = types.ModuleType("nodes")
         nodes.NODE_CLASS_MAPPINGS = {"llama_cpp_model_loader": loader}
@@ -144,6 +195,47 @@ class LinuxBackendTests(unittest.TestCase):
         second = self.runtime.llm
         self.runtime.stop()
         self.assertTrue(second.closed)
+        self.assertIsNone(self.storage.llm)
+
+    def test_text_only_loading_does_not_construct_a_vision_handler(self):
+        self.start()
+        self.assertEqual(self.storage.current_config["chat_handler"], "None")
+        self.assertEqual(self.storage.current_config["mmproj"], "None")
+        self.assertIsNone(self.storage.chat_handler)
+
+    def test_text_inference_renders_GGUF_template_and_switches_thinking(self):
+        self.start()
+        llm = self.runtime.llm
+        for thinking in (True, False, True):
+            payload = self.payload(thinking=thinking)
+            original = copy.deepcopy(payload)
+            self.runtime._post_completion(payload, 10)
+            ending = "<think>\n" if thinking else "<think>\n\n</think>\n\n"
+            self.assertTrue(llm.prompts[-1].endswith(ending))
+            self.assertIn("Make it blue.", llm.prompts[-1])
+            self.assertEqual(llm.calls[-1][0]["content"], "Make it blue.")
+            self.assertEqual(payload, original)
+            self.assertIsNone(llm.chat_handler)
+        self.assertEqual(len(self.storage.loads), 1)
+
+    def test_text_only_rewrite_and_translation_run_without_mmproj(self):
+        self.start()
+        answer, _info = self.runtime.complete("t2i", "A blue dog.", [], 42, 10)
+        self.assertEqual(answer["rewritten_prompt"], "A blue dog.")
+        self.runtime.llm.response = "一只蓝色的狗。"
+        translated, _usage = self.runtime._translate_prose("A blue dog.", "中文", 42, 10)
+        self.assertEqual(translated, "一只蓝色的狗。")
+        self.assertTrue(self.runtime.llm.prompts[-1].endswith("<think>\n\n</think>\n\n"))
+
+    def test_text_path_rejects_image_content_and_missing_template(self):
+        self.start()
+        with self.assertRaisesRegex(ValueError, "Image input requires"):
+            self.runtime._post_completion(self.payload(["image-data"]), 10)
+        self.assertIsNone(self.storage.llm)
+        self.start()
+        self.runtime.llm.metadata.clear()
+        with self.assertRaisesRegex(RuntimeError, "missing tokenizer.chat_template"):
+            self.runtime._post_completion(self.payload(), 10)
         self.assertIsNone(self.storage.llm)
 
     def test_reload_after_atomic_model_and_projector_replacement(self):

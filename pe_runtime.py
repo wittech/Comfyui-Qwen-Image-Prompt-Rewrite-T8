@@ -530,7 +530,8 @@ class LocalRuntime:
             config = {
                 "model": str(model.resolve()),
                 "mmproj": str(mmproj.resolve()) if mmproj else "None",
-                "chat_handler": "Qwen3.5-Thinking",
+                # The upstream Qwen3.5 handler requires a vision projector.
+                "chat_handler": "Qwen3.5-Thinking" if mmproj else "None",
                 "n_ctx": context, "vram_limit": -1,
                 "image_min_tokens": 1024 if mmproj else 0,
                 "image_max_tokens": 0, "load_mtp": False,
@@ -778,6 +779,26 @@ class LocalRuntime:
             raise ValueError("translation fallback returned empty text")
         return translated, result.get("usage", {})
 
+    def _text_chat_handler(self, thinking):
+        """Use the GGUF text template without constructing a vision handler."""
+        template = self.llm.metadata.get("tokenizer.chat_template")
+        if not isinstance(template, str) or not template.strip():
+            raise RuntimeError("The text GGUF is missing tokenizer.chat_template")
+
+        def token_text(token_id):
+            if token_id < 0:
+                return ""
+            return self.llm.detokenize([token_id], special=True).decode("utf-8")
+
+        eos = self.llm.token_eos()
+        formatter = self.module.llama_cpp.llama_chat_format.Jinja2ChatFormatter(
+            template="{% set enable_thinking = " + ("true" if thinking else "false")
+                     + " %}" + template,
+            eos_token=token_text(eos), bos_token=token_text(self.llm.token_bos()),
+            stop_token_ids=[eos] if eos >= 0 else None,
+        )
+        return formatter.to_chat_handler()
+
     def _post_completion(self, payload, timeout):
         """Call the installed plugin's model without a server or HTTP transport."""
         with self.lock:
@@ -800,13 +821,30 @@ class LocalRuntime:
                 kwargs["present_penalty"] = kwargs.pop("presence_penalty")
             handler = self.storage.chat_handler
             thinking = template_args.get("enable_thinking", True)
-            old_thinking = handler.enable_thinking
-            old_template_thinking = handler.extra_template_arguments["enable_thinking"]
+            llm = self.llm
+            old_chat_handler = llm.chat_handler
+            if handler is not None:
+                old_thinking = handler.enable_thinking
+                old_template_thinking = handler.extra_template_arguments["enable_thinking"]
             try:
                 guard()
                 self.storage.ensure_embedding_mode(False)
-                handler.enable_thinking = thinking
-                handler.extra_template_arguments["enable_thinking"] = thinking
+                if handler is None:
+                    # Generic text templates expect string content. Preserve
+                    # literal user text and avoid mutating the retry payload.
+                    messages = []
+                    for message in kwargs["messages"]:
+                        content = message.get("content")
+                        if isinstance(content, list):
+                            if any(item.get("type") != "text" for item in content):
+                                raise ValueError("Image input requires a model with mmproj")
+                            message = {**message, "content": "".join(item["text"] for item in content)}
+                        messages.append(message)
+                    kwargs["messages"] = messages
+                    llm.chat_handler = self._text_chat_handler(thinking)
+                else:
+                    handler.enable_thinking = thinking
+                    handler.extra_template_arguments["enable_thinking"] = thinking
                 self.llm.reset()
                 kwargs["logits_processor"] = self.module.llama_cpp.LogitsProcessorList([guard])
                 result = self.llm.create_chat_completion(**kwargs)
@@ -822,8 +860,10 @@ class LocalRuntime:
                 self.stop()
                 raise
             finally:
-                handler.enable_thinking = old_thinking
-                handler.extra_template_arguments["enable_thinking"] = old_template_thinking
+                llm.chat_handler = old_chat_handler
+                if handler is not None:
+                    handler.enable_thinking = old_thinking
+                    handler.extra_template_arguments["enable_thinking"] = old_template_thinking
 
 
 SERVER = LocalRuntime()

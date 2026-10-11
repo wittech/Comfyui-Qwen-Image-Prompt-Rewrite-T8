@@ -54,7 +54,7 @@ python -m pip install -r ComfyUI-llama-cpp_vlm/requirements.txt
 
 这里的 `python` 必须是 ComfyUI 使用的解释器。该插件的默认依赖包含 Linux x86_64 CUDA 12.8 的 JamePeng `llama-cpp-python` wheel；CUDA 13 环境请按上游说明使用 `requirements_cu131.txt`。其他架构或 CPU 环境需要自行安装兼容的 JamePeng 构建。本项目不自动安装或替换已有推理依赖。
 
-两个 PE 模型基于 Qwen3.5，因此后端必须提供 **`Qwen35ChatHandler`**。加载采用 `Qwen3.5-Thinking` 处理器；格式重试及翻译会临时关闭思考。编辑模型会一起加载配套 mmproj，主模型默认使用上游的全层 GPU 卸载配置。启动后可在 ComfyUI 中直接运行本项目现有工作流，无需额外连接上游加载节点。
+两个 PE 模型基于 Qwen3.5，因此后端必须提供 **`Qwen35ChatHandler`**。文生图采用纯文本加载（`chat_handler=None`），使用 GGUF 自带的聊天模板，不需要 mmproj；图像编辑采用 `Qwen3.5-Thinking` 视觉处理器，并加载配套 mmproj。两条路径都支持思考开关，格式重试及翻译会临时关闭思考。主模型默认使用上游的全层 GPU 卸载配置。启动后可在 ComfyUI 中直接运行本项目现有工作流，无需额外连接上游加载节点。
 
 支持原有的节点模型目录、`ComfyUI/models/llm/qwenimage-pe/`、`QWEN_PE_MODEL_DIR`，也支持上游的 **`ComfyUI/models/LLM/`（注意大小写）**及其注册的附加目录。模型与配套 mmproj 应放在同一目录。
 
@@ -103,6 +103,7 @@ python -m pip install -r ComfyUI-llama-cpp_vlm/requirements.txt
 | `ComfyUI-llama-cpp_vlm is not loaded` | 检查插件已安装、启用且成功导入，并使用 ComfyUI 的 Python 安装上游 Linux 依赖后重启。 |
 | `Native model loading exceeded ... seconds` | 同步加载返回后发现超时，模型已释放。查看 ComfyUI 控制台；加载确实较慢时增大 `startup_timeout`，重复调用可用 `keep_loaded`。 |
 | `Qwen35ChatHandler` 不可用 | 更新 ComfyUI-llama-cpp_vlm 及其 JamePeng Linux wheel；普通旧版 llama-cpp-python 不一定支持 Qwen3.5。 |
+| 文生图报 `Qwen35ChatHandler(__init__): mmproj_path is required` | 更新本节点并重启 ComfyUI。文生图应走纯文本加载，不需要下载视觉组件；旧实现错误地为纯文本模型创建了视觉处理器。 |
 | 编辑模式提示缺少 mmproj | 确认 I2I 主模型和视觉文件同目录，或在 `vision_model` 中选择匹配文件。 |
 | `model response reached the generation or context limit` | 节点会关闭思考重试一次；仍失败时查看错误中的 token 用量，减少输入图片或缩短原始要求。多图模式会占用更多显存。 |
 | `model failed format validation` | 模型两次都未返回合规的 JSON、比例、语言或图片编号；查看报错详情。成功运行时可用 `diagnostics` 核对任务及图片端口映射。 |
