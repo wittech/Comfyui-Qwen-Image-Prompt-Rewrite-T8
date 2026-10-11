@@ -1,4 +1,4 @@
-"""Exercise local model reuse, switching, and explicit unload for 20 cycles."""
+"""Run via runpy inside Linux ComfyUI after custom nodes load; exercise 20 cycles."""
 
 import json
 from pathlib import Path
@@ -31,6 +31,7 @@ def gpu_mb():
         return None
 
 
+REPORT.parent.mkdir(parents=True, exist_ok=True)
 with REPORT.open("w", encoding="utf-8") as stream:
     try:
         for cycle in range(1, 21):
@@ -40,13 +41,13 @@ with REPORT.open("w", encoding="utf-8") as stream:
                 model = resolve_model(model_name)
                 vision = resolve_model(vision_name, True) if vision_name else None
                 SERVER.start(model, vision, context, 99)
-                current = SERVER.process
-                assert current is not None and current.poll() is None
-                assert prior is None or prior.poll() is not None, "previous model process remained active"
-                current_pid = current.pid
+                current = SERVER.llm
+                assert current is not None and SERVER.storage.llm is current
+                assert prior is None or prior is not current, "previous model was not replaced"
+                current_id = id(current)
                 SERVER.start(model, vision, context, 99)
-                assert SERVER.process.pid == current_pid, "same profile did not reuse the process"
-                record = {"cycle": cycle, "profile": label, "pid": current_pid,
+                assert SERVER.llm is current, "same profile did not reuse the model"
+                record = {"cycle": cycle, "profile": label, "model_id": current_id,
                           "elapsed_seconds": round(time.monotonic() - started, 2),
                           "gpu_mb": gpu_mb()}
                 stream.write(json.dumps(record) + "\n")
@@ -54,7 +55,7 @@ with REPORT.open("w", encoding="utf-8") as stream:
                 print(json.dumps(record), flush=True)
                 prior = current
             SERVER.stop()
-            assert prior.poll() is not None, "explicit unload left a model process running"
+            assert SERVER.llm is None, "explicit unload left a model loaded"
             record = {"cycle": cycle, "profile": "unloaded", "gpu_mb": gpu_mb()}
             stream.write(json.dumps(record) + "\n")
             stream.flush()

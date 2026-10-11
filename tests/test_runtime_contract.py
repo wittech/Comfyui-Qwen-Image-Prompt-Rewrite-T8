@@ -3,20 +3,15 @@ import base64
 import io
 import json
 from pathlib import Path
-import sys
 import tempfile
-import threading
-import types
 import unittest
-from unittest.mock import MagicMock, patch
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.error import URLError
+from unittest.mock import patch
 
 import torch
 from PIL import Image
 
-from pe_runtime import (DEFAULT_EDIT, DEFAULT_T2I, DEFAULT_MMPROJ, LOCAL_OPENER,
-                        LocalServer, file_signature, local_models,
+from pe_runtime import (DEFAULT_EDIT, DEFAULT_T2I, DEFAULT_MMPROJ,
+                        LocalRuntime, file_signature, local_models,
                         normalize_single_image_references, parse_answer, pick_mmproj,
                         prepare_images, quoted_literals,
                         remove_opaque_background_sentences, validate_language, validate_mode,
@@ -24,70 +19,6 @@ from pe_runtime import (DEFAULT_EDIT, DEFAULT_T2I, DEFAULT_MMPROJ, LOCAL_OPENER,
 
 
 class RuntimeContractTests(unittest.TestCase):
-    def test_slow_startup_can_finish_after_old_180_second_limit(self):
-        import pe_runtime
-        with tempfile.TemporaryDirectory() as temp:
-            model = Path(temp) / "model.gguf"
-            model.write_bytes(b"stub")
-            process = MagicMock()
-            process.poll.return_value = None
-            health = MagicMock()
-            health.status = 200
-            health.__enter__.return_value = health
-            elapsed = [0]
-            def loading_then_healthy(*_args, **_kwargs):
-                if elapsed[0] < 240:
-                    elapsed[0] += 120
-                    raise URLError("model loading")
-                return health
-            with (patch.object(pe_runtime, "ROOT", Path(temp)),
-                  patch.object(LocalServer, "binary", return_value=Path(temp) / "server"),
-                  patch.object(pe_runtime.subprocess, "Popen", return_value=process),
-                  patch.object(pe_runtime.LOCAL_OPENER, "open", side_effect=loading_then_healthy),
-                  patch.object(pe_runtime.time, "monotonic", side_effect=lambda: elapsed[0]),
-                  patch.object(pe_runtime.time, "sleep"), patch("builtins.print"),
-                  patch.dict(sys.modules, {"comfy": None, "comfy.model_management": None})):
-                server = LocalServer()
-                server.start(model, None, 1024, 0)
-                self.assertEqual(elapsed[0], 240)
-                self.assertIs(server.process, process)
-                self.assertFalse(process.terminate.called)
-                server.stop()
-
-    def test_custom_startup_timeout_reports_log_and_cleans_up(self):
-        import pe_runtime
-        with tempfile.TemporaryDirectory() as temp:
-            model = Path(temp) / "model.gguf"
-            model.write_bytes(b"stub")
-            process = MagicMock()
-            process.poll.return_value = None
-            elapsed = [0]
-            def unavailable(*_args, **_kwargs):
-                elapsed[0] = 60
-                raise URLError("model loading")
-            with (patch.object(pe_runtime, "ROOT", Path(temp)),
-                  patch.object(LocalServer, "binary", return_value=Path(temp) / "server"),
-                  patch.object(pe_runtime.subprocess, "Popen", return_value=process),
-                  patch.object(pe_runtime.LOCAL_OPENER, "open", side_effect=unavailable),
-                  patch.object(pe_runtime.time, "monotonic", side_effect=lambda: elapsed[0]),
-                  patch.object(pe_runtime.time, "sleep"), patch("builtins.print"),
-                  patch.dict(sys.modules, {"comfy": None, "comfy.model_management": None})):
-                server = LocalServer()
-                with self.assertRaisesRegex(TimeoutError, "within 60 seconds.*server.log.*startup_timeout"):
-                    server.start(model, None, 1024, 0, startup_timeout=60)
-                self.assertTrue(process.terminate.called)
-                self.assertIsNone(server.process)
-                self.assertIsNone(server.port)
-                self.assertIsNone(server.log)
-
-    def test_missing_runtime_points_to_install_instructions(self):
-        import pe_runtime
-        with tempfile.TemporaryDirectory() as temp:
-            with (patch.object(pe_runtime, "ROOT", Path(temp)),
-                  patch.dict(os.environ, {"QWEN_PE_LLAMA_SERVER": ""})):
-                with self.assertRaisesRegex(FileNotFoundError, "README.md#install-llama-server-windows"):
-                    LocalServer.binary()
-
     def test_parse_t2i_json_after_thinking_text(self):
         raw = '<think>the example {"wrong": 1} is invalid</think>\n{"rewritten_prompt":"a blue dog", "wh_ratio":"3:2"}'
         self.assertEqual(parse_answer(raw, "t2i", 0)["wh_ratio"], "3:2")
@@ -270,9 +201,14 @@ class RuntimeContractTests(unittest.TestCase):
                 self.assertNotIn("another.mmproj.gguf", local_models())
 
     def test_known_vision_project_cannot_pair_with_t2i_weight(self):
-        self.assertEqual(pick_mmproj(DEFAULT_EDIT, "Auto").name, DEFAULT_MMPROJ)
-        with self.assertRaises(ValueError):
-            pick_mmproj(DEFAULT_T2I, DEFAULT_MMPROJ)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name in (DEFAULT_EDIT, DEFAULT_T2I, DEFAULT_MMPROJ):
+                (root / name).write_bytes(b"stub")
+            with patch("pe_runtime.model_roots", side_effect=lambda: iter([root])):
+                self.assertEqual(pick_mmproj(DEFAULT_EDIT, "Auto").name, DEFAULT_MMPROJ)
+                with self.assertRaises(ValueError):
+                    pick_mmproj(DEFAULT_T2I, DEFAULT_MMPROJ)
 
     def test_auto_vision_model_uses_the_model_directory(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -336,58 +272,9 @@ class RuntimeContractTests(unittest.TestCase):
             os.replace(replacement, path)
             self.assertNotEqual(file_signature(path), before)
 
-    def test_server_cleans_up_after_failed_start_and_interrupt(self):
-        class FakeProcess:
-            def __init__(self, exited):
-                self.exited = exited
-                self.terminated = False
-                self.returncode = 1 if exited else None
-
-            def poll(self):
-                return self.returncode
-
-            def terminate(self):
-                self.terminated = True
-                self.returncode = 0
-
-            def wait(self, timeout):
-                return self.returncode
-
-        with tempfile.TemporaryDirectory() as temp:
-            import pe_runtime
-            model = Path(temp) / "model.gguf"
-            model.write_bytes(b"stub")
-            exited = FakeProcess(True)
-            with (patch.object(pe_runtime, "ROOT", Path(temp)),
-                  patch.object(LocalServer, "binary", return_value=Path(temp) / "server"),
-                  patch.object(pe_runtime.subprocess, "Popen", return_value=exited)):
-                server = LocalServer()
-                with self.assertRaisesRegex(RuntimeError, "exited"):
-                    server.start(model, None, 1024, 0)
-                self.assertIsNone(server.process)
-                self.assertIsNone(server.profile)
-                self.assertIsNone(server.log)
-
-            interrupted = FakeProcess(False)
-            comfy = types.ModuleType("comfy")
-            memory = types.ModuleType("comfy.model_management")
-            def interrupt():
-                raise KeyboardInterrupt()
-            memory.throw_exception_if_processing_interrupted = interrupt
-            comfy.model_management = memory
-            with (patch.object(pe_runtime, "ROOT", Path(temp)),
-                  patch.object(LocalServer, "binary", return_value=Path(temp) / "server"),
-                  patch.object(pe_runtime.subprocess, "Popen", return_value=interrupted),
-                  patch.dict(sys.modules, {"comfy": comfy, "comfy.model_management": memory})):
-                server = LocalServer()
-                with self.assertRaises(KeyboardInterrupt):
-                    server.start(model, None, 1024, 0)
-                self.assertTrue(interrupted.terminated)
-                self.assertIsNone(server.process)
-                self.assertIsNone(server.log)
 
     def test_completion_uses_only_user_quoted_text_as_exact_literal(self):
-        server = LocalServer()
+        server = LocalRuntime()
         def response(answer):
             return {"choices": [{"message": {"content": json.dumps(answer)},
                                  "finish_reason": "stop"}], "usage": {}}
@@ -406,7 +293,7 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertIn('"white background"', actual["rewritten_prompt"])
 
     def test_truncated_completion_retries_without_thinking_then_validates(self):
-        server = LocalServer()
+        server = LocalRuntime()
         server.profile = ("model", None, 24576, 99)
         requests = []
         def reply(payload, _timeout):
@@ -453,7 +340,7 @@ class RuntimeContractTests(unittest.TestCase):
         )
         for task, images, invalid, valid, rule in cases:
             with self.subTest(task=task):
-                server = LocalServer()
+                server = LocalRuntime()
                 requests = []
                 def reply(payload, _timeout):
                     requests.append((payload["chat_template_kwargs"]["enable_thinking"],
@@ -478,7 +365,7 @@ class RuntimeContractTests(unittest.TestCase):
                          'Recolor <image1> and leave the label "<image1>" untouched.')
         chinese, count = normalize_single_image_references("把<image>中的猫改为蓝色。")
         self.assertEqual((chinese, count), ("把<image1>中的猫改为蓝色。", 1))
-        server = LocalServer()
+        server = LocalRuntime()
         response = {"choices": [{"message": {"content": json.dumps({
             "rewritten_prompt": "Change <image> to blue.", "wh_ratio": "",
             "ratio_follow": "<image1>"})}, "finish_reason": "stop"}], "usage": {}}
@@ -491,7 +378,7 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(info["format_retries"], 0)
 
     def test_translation_requires_exact_text_to_remain_quoted(self):
-        server = LocalServer()
+        server = LocalRuntime()
         result = {"choices": [{"message": {"content":
                   "HELLO appears elsewhere; the sign says 'GOODBYE'."},
                   "finish_reason": "stop"}], "usage": {}}
@@ -508,7 +395,7 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(translated, 'The sign says "HELLO".')
 
     def test_chinese_translation_repairs_residual_english_before_format_retry(self):
-        server = LocalServer()
+        server = LocalRuntime()
         base = {"rewritten_prompt": "A muted red desk lamp with a fitted lid.",
                 "wh_ratio": "1:1"}
         responses = [
@@ -533,7 +420,7 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertIn(base["rewritten_prompt"], second_translation["messages"][1]["content"])
 
     def test_chinese_edit_preserves_english_sign_read_from_image(self):
-        server = LocalServer()
+        server = LocalRuntime()
         original = {"rewritten_prompt": "Brighten <image1> while preserving the billboard title "
                     "'SUMMER SALE' exactly.", "wh_ratio": "", "ratio_follow": "<image1>"}
         responses = [
@@ -550,85 +437,6 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertIn("'SUMMER SALE'", answer["rewritten_prompt"])
         self.assertEqual(info["format_retries"], 0)
         self.assertTrue(info["translation_fallback"])
-
-    def test_loopback_health_and_completion_bypass_environment_proxy(self):
-        class Handler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(b"healthy")
-
-            def do_POST(self):
-                self.rfile.read(int(self.headers["Content-Length"]))
-                body = b'{"ok": true}'
-                self.send_response(200)
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, *_args):
-                pass
-
-        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-        thread.start()
-        try:
-            proxy = {"HTTP_PROXY": "http://127.0.0.1:1",
-                     "HTTPS_PROXY": "http://127.0.0.1:1",
-                     "http_proxy": "http://127.0.0.1:1",
-                     "https_proxy": "http://127.0.0.1:1",
-                     "NO_PROXY": "", "no_proxy": ""}
-            with patch.dict(os.environ, proxy):
-                with LOCAL_OPENER.open(f"http://127.0.0.1:{httpd.server_port}/health", timeout=2) as response:
-                    self.assertEqual(response.status, 200)
-                server = LocalServer()
-                server.port = httpd.server_port
-                self.assertEqual(server._post_completion({"model": "test"}, 2), {"ok": True})
-        finally:
-            httpd.shutdown()
-            httpd.server_close()
-            thread.join(timeout=2)
-
-    def test_kept_server_reloads_replaced_model_file(self):
-        class FakeProcess:
-            returncode = None
-            terminated = False
-
-            def poll(self):
-                return self.returncode
-
-            def terminate(self):
-                self.terminated = True
-                self.returncode = 0
-
-            def wait(self, timeout):
-                return self.returncode
-
-        with tempfile.TemporaryDirectory() as temp:
-            import pe_runtime
-            model = Path(temp) / "model.gguf"
-            model.write_bytes(b"old")
-            first, second = FakeProcess(), FakeProcess()
-            health = MagicMock()
-            health.status = 200
-            health.__enter__.return_value = health
-            with (patch.object(pe_runtime, "ROOT", Path(temp)),
-                  patch.object(LocalServer, "binary", return_value=Path(temp) / "server"),
-                  patch.object(pe_runtime.subprocess, "Popen", side_effect=[first, second]) as launch,
-                  patch.object(pe_runtime.LOCAL_OPENER, "open", return_value=health)):
-                server = LocalServer()
-                server.start(model, None, 1024, 0)
-                server.start(model, None, 1024, 0)
-                self.assertEqual(launch.call_count, 1)
-                old_stat = model.stat()
-                replacement = Path(temp) / "replacement.gguf"
-                replacement.write_bytes(b"new")
-                os.utime(replacement, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns))
-                os.replace(replacement, model)
-                server.start(model, None, 1024, 0)
-                self.assertTrue(first.terminated)
-                self.assertEqual(launch.call_count, 2)
-                server.stop()
 
 
 if __name__ == "__main__":

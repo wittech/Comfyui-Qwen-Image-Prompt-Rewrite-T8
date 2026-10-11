@@ -70,8 +70,8 @@ class QwenPERewrite:
             },
             "optional": {**images, "startup_timeout": ("INT", {
                 "default": DEFAULT_STARTUP_TIMEOUT, "min": 30, "max": 7200, "step": 30,
-                "tooltip": "模型启动等待秒数，默认 900（15 分钟）；加载较慢时可增大。"
-                           " / Model startup timeout in seconds; increase for slow loading.",
+                "tooltip": "原生加载预算，默认 900 秒；同步加载返回后检查，不能强制中断加载。"
+                           " / Native load budget, checked when synchronous loading returns.",
             })},
         }
 
@@ -140,7 +140,7 @@ class QwenPERewrite:
         started = time.monotonic()
         with SERVER.lock:
             try:
-                SERVER.start(model, mmproj, context, 99, startup_timeout=startup_timeout)
+                SERVER.start(model, mmproj, context, -1, startup_timeout=startup_timeout)
                 answer, info = SERVER.complete(actual_task, user_prompt, encoded, seed, 900,
                                                output_language, aspect_ratio, transparent_rgba)
             finally:
@@ -157,6 +157,7 @@ class QwenPERewrite:
         template_hash = hashlib.sha256((Path(__file__).resolve().parent / "prompts" / template_name).read_bytes()).hexdigest()
         result = {
             "task": actual_task,
+            "backend": "ComfyUI-llama-cpp_vlm",
             "rewritten_prompt": final_prompt,
             "wh_ratio": answer["wh_ratio"],
             "ratio_follow": answer.get("ratio_follow", ""),

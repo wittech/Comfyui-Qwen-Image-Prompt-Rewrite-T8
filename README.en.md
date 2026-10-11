@@ -6,7 +6,7 @@ A local prompt rewriting node for ComfyUI. Give it text alone, or text plus 1–
 
 > **What the models do:** The GGUF files in this project **rewrite prompts**. To generate images, your ComfyUI workflow also needs a Qwen Image 2.1 diffusion model, text encoder, and VAE. Those are separate downloads.
 
-> **Before the first run, install two separate components:** at least one PE GGUF model set and the llama.cpp `llama-server.exe` runtime. ComfyUI Manager / Registry installs the node code **without the GGUF files or EXE**. For a missing EXE, follow the [Windows instructions below](#install-llama-server-windows).
+> **Linux only.** Uses the installed and enabled [ComfyUI-llama-cpp_vlm](https://github.com/lihaoyun6/ComfyUI-llama-cpp_vlm) plugin to load GGUF and run inference directly inside ComfyUI. Download PE models separately; models and inference dependencies are not bundled here.
 
 [GGUF model mirror](https://huggingface.co/t8star/qwen-image-2.1-comfy) · [ComfyUI Registry page](https://registry.comfy.org/zh/publishers/t8star/nodes/qwen-image-prompt-rewrite-t8) · [Example workflows](workflows/) · [Report an issue](https://github.com/T8mars/Comfyui-Qwen-Image-Prompt-Rewrite-T8/issues/new)
 
@@ -39,34 +39,26 @@ A local prompt rewriting node for ComfyUI. Give it text alone, or text plus 1–
 
    The source repository does not provide a Q4 vision component, so this project uses the BF16 file. You may also use `ComfyUI/models/llm/qwenimage-pe/` or set `QWEN_PE_MODEL_DIR` to a custom model directory. Model weights are not bundled with the GitHub source or Registry package.
 
-3. Install `llama-server.exe` using the next section. ComfyUI's Python environment must contain `torch`, `numpy`, and `Pillow`.
+3. Check the installed `ComfyUI-llama-cpp_vlm` plugin and its Linux dependencies using the next section. ComfyUI's Python environment must contain `torch`, `numpy`, and `Pillow`.
 
 After restarting ComfyUI, find the nodes under **Qwen Image 2.1 / Prompt Rewrite**. Registry availability may change; use the repository installation steps above if the node is not offered in Manager.
 
-## Install llama-server (Windows)
+## Linux inference backend
 
-This node launches the official llama.cpp **`llama-server.exe`** locally to rewrite prompts. It is separate from the GGUF models. The `llama-cpp-python` wheel does **not** supply this executable, so `pip install llama-cpp-python` does not fix a missing-EXE error.
+If your ComfyUI already includes `ComfyUI-llama-cpp_vlm`, enable it and check that it imports successfully at startup. This node finds the plugin through ComfyUI's node registry, including renamed installation directories. Otherwise, run from `ComfyUI/custom_nodes/`:
 
-**Windows x64 with NVIDIA:** download **both** prebuilt CUDA 12.4 ZIPs from the [official llama.cpp b11068 release](https://github.com/ggml-org/llama.cpp/releases/tag/b11068):
-
-1. [llama-b11068-bin-win-cuda-12.4-x64.zip — main program, including `llama-server.exe`](https://github.com/ggml-org/llama.cpp/releases/download/b11068/llama-b11068-bin-win-cuda-12.4-x64.zip)
-2. [cudart-llama-bin-win-cuda-12.4-x64.zip — matching CUDA DLLs](https://github.com/ggml-org/llama.cpp/releases/download/b11068/cudart-llama-bin-win-cuda-12.4-x64.zip)
-
-Find the **actual node directory** containing `pe_runtime.py` and `tools/` (Manager may choose a different folder name). Create `runtime/llama-b11068/` inside it and extract the **contents of both ZIPs into that same directory**. The result should contain:
-
-```text
-<node directory>/runtime/llama-b11068/llama-server.exe
-<node directory>/runtime/llama-b11068/cudart64_12.dll
-<node directory>/runtime/llama-b11068/cublas64_12.dll
+```bash
+git clone https://github.com/lihaoyun6/ComfyUI-llama-cpp_vlm.git
+python -m pip install -r ComfyUI-llama-cpp_vlm/requirements.txt
 ```
 
-Do not leave the executable inside a ZIP, put it in the GGUF model directory, or create an extra nested folder. Alternatively, open PowerShell in the node directory and download/extract the same official packages with:
+Use ComfyUI's Python interpreter. The upstream default requirements include a Linux x86_64 CUDA 12.8 JamePeng `llama-cpp-python` wheel; for CUDA 13, follow upstream's `requirements_cu131.txt` instructions. Other architectures or CPU setups need a compatible JamePeng build. This project does not install or replace your inference dependencies automatically.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\download_runtime.ps1
-```
+Both PE models use Qwen3.5, so the backend must provide **`Qwen35ChatHandler`**. Loading uses `Qwen3.5-Thinking`; format retries and translation temporarily disable thinking. Editing loads the matching mmproj with the model. GPU placement follows the upstream full-offload configuration. Existing workflows run directly; no additional upstream loader node connection is needed.
 
-Check the installation from that directory with `Test-Path .\runtime\llama-b11068\llama-server.exe`; it should return `True`. Restart ComfyUI. If you keep the runtime elsewhere, set `QWEN_PE_LLAMA_SERVER` to the **full path** of its executable before restarting. On Linux/macOS, select the appropriate binary from the [official release](https://github.com/ggml-org/llama.cpp/releases/tag/b11068) and set this environment variable.
+Model discovery retains the node-local model directory, `ComfyUI/models/llm/qwenimage-pe/`, and `QWEN_PE_MODEL_DIR`. It also searches upstream's **`ComfyUI/models/LLM/` (case-sensitive)** and registered additional directories. Keep each main model and matching mmproj together.
+
+Inference runs inside the ComfyUI process. The old `QWEN_PE_LLAMA_SERVER` setting is unused. `keep_loaded` shares upstream model storage: switching models replaces the previous model, and ComfyUI unload operations release it. **PE Unload T8** releases only the model still owned by this node, preserving a replacement loaded by another VLM node.
 
 ## Using the nodes
 
@@ -85,7 +77,7 @@ Enter your instruction in `user_prompt` and choose the following options in **PE
 - `output_language`: `auto`, `中文`, or `English`. With an explicit language, the node checks the rewrite and, if needed, translates it with the local model. The language choice applies to **descriptive prose**; quoted text requested by the user and visible English titles, signs, and labels in reference images remain verbatim in quotation marks.
 - `transparent_rgba`: Adds RGBA, alpha-channel, and transparent-background instructions to the final prompt. **This constrains the prompt; it does not guarantee that the downstream image has an alpha channel.**
 - `model_lifetime`: `after_run` unloads after success or failure. `keep_loaded` speeds up repeated calls; use **PE Unload T8** when finished.
-- `startup_timeout`: Model startup wait in seconds, default `900` (15 minutes), range `30–7200`. Use `1800` (30 minutes) for slow disks or lower-spec machines. This controls loading time only. Older workflows that omit it also use the new 900-second default.
+- `startup_timeout`: Native model loading budget, default `900` seconds, range `30–7200`. Retained for workflow compatibility. Checked after synchronous native loading returns, with cleanup on timeout; it cannot forcibly interrupt loading. Older workflows that omit it use 900 seconds.
 
 Each `image_1` through `image_10` input accepts one IMAGE, not a batch. Inputs returning `None` are skipped; remaining images are numbered in port order. For example, if `image_1` has an image, `image_2` is `None`, and `image_9` has an image, their prompt references are `<image1>` and `<image2>`. `PE_RESULT.image_input_ports` records the original ports. A single-image rewrite may describe the image naturally or use `<image1>`; a multi-image rewrite must include every tag from `<image1>` through `<imageN>`. If you connect the output to `TextEncodeQwenImage21`, give that node the same images in the same order.
 
@@ -95,7 +87,7 @@ Drag a JSON file from [workflows/](workflows/) onto the ComfyUI canvas, or place
 
 | Scenario | Workflow | Extra requirement |
 | --- | --- | --- |
-| Rewrite a text-to-image prompt | [Text-to-Image-Ready](workflows/Qwen-PE-2.1-Text-to-Image-Ready.json) | PE GGUF and llama-server |
+| Rewrite a text-to-image prompt | [Text-to-Image-Ready](workflows/Qwen-PE-2.1-Text-to-Image-Ready.json) | PE GGUF and ComfyUI-llama-cpp_vlm |
 | Rewrite a two-image edit | [Edit-2-Images-Ready](workflows/Qwen-PE-2.1-Edit-2-Images-Ready.json) | Choose files in both `LoadImage` nodes |
 | Generate a complete text-to-image result | [Full-T2I](workflows/Qwen-PE-2.1-Full-T2I.json) | Separate diffusion model, text encoder, and VAE |
 | Generate a complete two-image edit | [Full-Edit-2-Images](workflows/Qwen-PE-2.1-Full-Edit-2-Images.json) | Same; reselect the reference images |
@@ -108,18 +100,18 @@ The directory also has Heretic text-to-image, Chinese and English transparency, 
 | Symptom | What to check |
 | --- | --- |
 | Empty model list or GGUF not found | Check the filenames and model directory. **PE Local Models T8** shows what the node discovered. |
-| `llama-server.exe not found` | This means the separate runtime is missing, not the model. Download both official ZIPs and extract them under the node's `runtime/llama-b11068/` as shown in the [Windows instructions](#install-llama-server-windows). |
-| `llama-server did not become healthy within 180 seconds` while the log still shows loading | Update to version 1.0.14 or later for the 900-second default; set `startup_timeout` to `1800` if loading is still slow. The console reports progress every 30 seconds. Check the node's `runtime/server.log`; resolve errors such as insufficient VRAM or missing DLLs first. Use `keep_loaded` to avoid loading again for each call. |
+| `ComfyUI-llama-cpp_vlm is not loaded` | Check that the plugin is installed, enabled, and imports successfully. Install upstream Linux requirements with ComfyUI's Python and restart. |
+| `Native model loading exceeded ... seconds` | The budget was exceeded when synchronous loading returned; the model was released. Check the ComfyUI console, increase `startup_timeout` for slow loading, or use `keep_loaded` for repeated calls. |
+| `Qwen35ChatHandler` unavailable | Update ComfyUI-llama-cpp_vlm and its JamePeng Linux wheel; older generic llama-cpp-python builds may lack Qwen3.5 support. |
 | Editing reports a missing mmproj | Put the matching I2I main model and vision file together, or choose the matching `vision_model`. |
 | `model response reached the generation or context limit` | The node retries once without thinking. If it still fails, inspect the token counts in the error, use fewer images, or shorten the instruction. Multi-image jobs use more VRAM. |
 | `model failed format validation` | Both attempts failed a JSON, ratio, language, or image-reference check. Read the error details. After a successful run, `diagnostics` can confirm the task and input-port mapping. |
-| `llama-server did not become healthy` although the log shows it listening | Update to version 1.0.11 or later; local health checks and inference bypass `HTTP_PROXY`/`HTTPS_PROXY`. On older versions, `NO_PROXY=127.0.0.1,localhost` is a temporary workaround. |
 | Chinese output reports `Chinese descriptive prose contains English words` | Update to version 1.0.11 or later; translation fallback now retries with feedback about the remaining English words. If it still fails, inspect the reported words and `diagnostics`. |
 | Chinese output fails language validation on an English title or sign in an input image | Update to version 1.0.13 or later; visible image text can remain verbatim while the surrounding description stays Chinese. |
 | `TextEncodeQwenImage21` is missing | Update to a ComfyUI release supporting Qwen Image 2.1. Prompt-only workflows do not need this node. |
 | The output PNG is still opaque | Check the downstream image model, VAE, and saving workflow. This node only writes the transparency prompt. |
 
-The local `llama-server` listens on `127.0.0.1` only, and the node's requests bypass environment proxies. A visual copy of each input is scaled to at most about one million pixels and a 4096-pixel longest side; PE Canvas retains the original dimensions. The response is checked for JSON structure, image references, language, and mode constraints, with one retry on validation failure; translation fallback is checked separately and can retry twice more.
+The installed VLM backend runs inference in-process without network requests. Generation checks interruption and timeout at each sampled token; native loading and image/prompt processing can only be checked after their native calls return. A visual copy of each input is scaled to at most about one million pixels and a 4096-pixel longest side; PE Canvas retains the original dimensions. The response is checked for JSON structure, image references, language, and mode constraints, with one retry on validation failure; translation fallback is checked separately and can retry twice more.
 
 ## Optional: Viggle Turbo 4-step LoRA
 

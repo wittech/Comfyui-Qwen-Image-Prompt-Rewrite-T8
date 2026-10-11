@@ -1,8 +1,9 @@
 [project]
 name = "qwen-image-prompt-rewrite-t8"
 version = "1.0.14"
-description = "Local Qwen Image 2.1 prompt rewriting for text-to-image and 1-10 image editing in ComfyUI"
+description = "Local Qwen Image 2.1 prompt rewriting for text-to-image and 1-10 image editing on Linux via ComfyUI-llama-cpp_vlm"
 requires-python = ">=3.10"
+classifiers = ["Operating System :: POSIX :: Linux"]
 dependencies = ["numpy", "Pillow"]
 
 [project.urls]

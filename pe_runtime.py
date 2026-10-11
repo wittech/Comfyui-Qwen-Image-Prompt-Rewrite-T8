@@ -6,12 +6,9 @@ import math
 import os
 from pathlib import Path
 import re
-import socket
-import subprocess
+import sys
 import threading
 import time
-from urllib.error import HTTPError, URLError
-from urllib.request import ProxyHandler, Request, build_opener
 
 import numpy as np
 from PIL import Image
@@ -20,9 +17,6 @@ from torch.nn.functional import interpolate
 
 
 ROOT = Path(__file__).resolve().parent
-# Every HTTP request in this module targets our own loopback llama-server.
-# Ignore process-wide proxy settings, which may otherwise intercept 127.0.0.1.
-LOCAL_OPENER = build_opener(ProxyHandler({}))
 DEFAULT_T2I = "Qwen-Image-2.1-PE-T2I.Q4_K_M.gguf"
 DEFAULT_EDIT = "Qwen-Image-2.1-PE-I2I.Q4_K_M.gguf"
 DEFAULT_MMPROJ = "Qwen-Image-2.1-PE-I2I.mmproj-bf16.gguf"
@@ -104,6 +98,10 @@ def model_roots():
     try:
         import folder_paths
         roots.append(Path(folder_paths.models_dir) / "llm" / "qwenimage-pe")
+        roots.append(Path(folder_paths.models_dir) / "LLM")
+        # The VLM plugin may not have registered this category yet at import time.
+        if "LLM" in folder_paths.folder_names_and_paths:
+            roots.extend(Path(path) for path in folder_paths.get_folder_paths("LLM"))
     except ImportError:
         pass
     seen = set()
@@ -443,125 +441,118 @@ def remove_opaque_background_sentences(prompt, protected_literals=None):
     return "".join(kept).strip(), removed
 
 
-class LocalServer:
+def require_linux():
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("Qwen PE T8 supports Linux only; run it inside Linux ComfyUI.")
+
+
+def vlm_module():
+    """Reuse the plugin ComfyUI already loaded, regardless of its folder name."""
+    require_linux()
+    try:
+        import nodes
+        loader = nodes.NODE_CLASS_MAPPINGS.get("llama_cpp_model_loader")
+        module = sys.modules.get(loader.__module__) if loader else None
+    except ImportError:
+        module = None
+    if module is None or not hasattr(module, "LLAMA_CPP_STORAGE"):
+        raise RuntimeError(
+            "ComfyUI-llama-cpp_vlm is not loaded. Install/enable "
+            "https://github.com/lihaoyun6/ComfyUI-llama-cpp_vlm in custom_nodes, "
+            "install its Linux requirements with ComfyUI's Python, and restart ComfyUI.")
+    if getattr(module, "Qwen35ChatHandler", None) is None:
+        raise RuntimeError(
+            "ComfyUI-llama-cpp_vlm needs Qwen35ChatHandler. Update the plugin and its "
+            "JamePeng/llama-cpp-python Linux wheel, then restart ComfyUI.")
+    return module
+
+
+def check_interrupt():
+    try:
+        import comfy.model_management as memory
+    except ImportError:
+        return
+    memory.throw_exception_if_processing_interrupted()
+
+
+class LocalRuntime:
+    """In-process inference through ComfyUI-llama-cpp_vlm's shared storage."""
+
     def __init__(self):
         self.lock = threading.RLock()
-        self.process = None
+        self.storage = None
+        self.llm = None
         self.profile = None
-        self.port = None
-        self.log = None
-
-    @staticmethod
-    def binary():
-        configured = os.environ.get("QWEN_PE_LLAMA_SERVER")
-        if configured:
-            path = Path(configured)
-            if path.is_file():
-                return path
-            raise FileNotFoundError(
-                f"QWEN_PE_LLAMA_SERVER points to a missing executable: {path}. "
-                "See https://github.com/T8mars/Comfyui-Qwen-Image-Prompt-Rewrite-T8/"
-                "blob/main/README.md#install-llama-server-windows")
-        matches = list((ROOT / "runtime").rglob("llama-server.exe"))
-        if not matches:
-            raise FileNotFoundError(
-                "llama-server.exe is missing. Install the two official llama.cpp Windows ZIPs "
-                "into this node's runtime/llama-b11068/ directory, or set "
-                "QWEN_PE_LLAMA_SERVER to its full path. Instructions: "
-                "https://github.com/T8mars/Comfyui-Qwen-Image-Prompt-Rewrite-T8/"
-                "blob/main/README.md#install-llama-server-windows")
-        if len(matches) != 1:
-            raise RuntimeError(
-                "Multiple llama-server.exe files found under runtime/. Set "
-                "QWEN_PE_LLAMA_SERVER to the one you want to use.")
-        return matches[0]
+        self.config = None
+        self.module = None
 
     def stop(self):
         with self.lock:
             try:
-                if self.process is not None:
-                    if self.process.poll() is None:
-                        self.process.terminate()
-                    try:
-                        self.process.wait(timeout=15)
-                    except subprocess.TimeoutExpired:
-                        self.process.kill()
-                        self.process.wait(timeout=10)
+                # Another VLM node may have replaced our model since keep_loaded.
+                if self.storage is not None and self.storage.llm is self.llm:
+                    self.storage.clean(all=True)
             finally:
-                self.process = None
-                if self.log is not None:
-                    self.log.close()
-                    self.log = None
-                self.profile = None
-                self.port = None
+                self.llm = self.storage = self.module = None
+                self.profile = self.config = None
 
-    def start(self, model, mmproj, context, gpu_layers,
+    def start(self, model, mmproj, context, gpu_layers=-1,
               startup_timeout=DEFAULT_STARTUP_TIMEOUT):
+        require_linux()
         if (isinstance(startup_timeout, bool) or not isinstance(startup_timeout, int)
                 or not 30 <= startup_timeout <= 7200):
             raise ValueError("startup_timeout must be an integer between 30 and 7200 seconds")
+        # The upstream loader owns GPU placement and offloads all layers.
+        # 99 was the previous internal full-offload value used by our tools.
+        if gpu_layers not in (-1, 99):
+            raise ValueError("ComfyUI-llama-cpp_vlm manages GPU layers; use -1 (all layers)")
         with self.lock:
+            module = vlm_module()
+            storage = module.LLAMA_CPP_STORAGE
             profile = (file_signature(model), file_signature(mmproj) if mmproj else None,
-                       context, gpu_layers)
-            if self.process is not None and self.process.poll() is None and self.profile == profile:
+                       context)
+            if (self.llm is not None and self.profile == profile
+                    and storage.llm is self.llm and storage.current_config == self.config):
                 try:
-                    with LOCAL_OPENER.open(f"http://127.0.0.1:{self.port}/health", timeout=2) as response:
-                        if response.status == 200:
-                            return
-                except (URLError, TimeoutError, HTTPError):
-                    pass
-            self.stop()
-            with socket.socket() as sock:
-                sock.bind(("127.0.0.1", 0))
-                port = sock.getsockname()[1]
-            command = [str(self.binary()), "-m", str(model), "--host", "127.0.0.1", "--port", str(port),
-                       "-c", str(context), "-ngl", str(gpu_layers), "--jinja", "--reasoning-format", "none",
-                       "--parallel", "1", "--alias", "qwen-pe"]
-            if mmproj:
-                command += ["--mmproj", str(mmproj), "--image-min-tokens", "1024"]
-            log_path = ROOT / "runtime" / "server.log"
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            self.log = log_path.open("ab")
-            flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                    check_interrupt()
+                except BaseException:
+                    self.stop()
+                    raise
+                return
             try:
-                self.process = subprocess.Popen(command, stdout=self.log, stderr=subprocess.STDOUT, creationflags=flags)
-                self.profile = profile
-                self.port = port
-                try:
-                    import comfy.model_management as memory
-                    check_interrupt = memory.throw_exception_if_processing_interrupted
-                except ImportError:
-                    check_interrupt = None
-                started_at = time.monotonic()
-                deadline = started_at + startup_timeout
-                next_report = started_at + 30
-                last_health_error = "no successful health response"
-                while time.monotonic() < deadline:
-                    if check_interrupt:
-                        check_interrupt()
-                    if self.process.poll() is not None:
-                        raise RuntimeError(f"llama-server exited with {self.process.returncode}; see {log_path}")
-                    try:
-                        with LOCAL_OPENER.open(f"http://127.0.0.1:{port}/health", timeout=3) as response:
-                            if response.status == 200:
-                                return
-                            last_health_error = f"HTTP {response.status}"
-                    except (URLError, TimeoutError, HTTPError) as exc:
-                        last_health_error = str(exc)
-                    now = time.monotonic()
-                    if now >= next_report:
-                        print(f"[Qwen PE T8] Loading {model.name}: waiting for llama-server "
-                              f"({now - started_at:.0f}/{startup_timeout} seconds); see {log_path}",
-                              flush=True)
-                        next_report = now + 30
-                    time.sleep(min(0.5, max(0, deadline - now)))
-                raise TimeoutError(
-                    f"llama-server did not become healthy within {startup_timeout} seconds. "
-                    f"Last health check: {last_health_error}. See {log_path}. "
-                    "If the log still shows model loading, increase the node's startup_timeout; "
-                    "if it shows an error, fix that error first.")
+                check_interrupt()
             except BaseException:
                 self.stop()
+                raise
+            self.stop()
+            self.module, self.storage = module, storage
+            # Absolute Linux paths work with upstream's os.path.join(models_dir, 'LLM', path).
+            config = {
+                "model": str(model.resolve()),
+                "mmproj": str(mmproj.resolve()) if mmproj else "None",
+                "chat_handler": "Qwen3.5-Thinking",
+                "n_ctx": context, "vram_limit": -1,
+                "image_min_tokens": 1024 if mmproj else 0,
+                "image_max_tokens": 0, "load_mtp": False,
+            }
+            started = time.monotonic()
+            try:
+                storage.load_model(config)
+                self.llm = storage.llm
+                if self.llm is None:
+                    raise RuntimeError("ComfyUI-llama-cpp_vlm did not load a model")
+                check_interrupt()
+                # Native loading is synchronous: check the budget after it returns.
+                if time.monotonic() - started > startup_timeout:
+                    raise TimeoutError(
+                        f"Native model loading exceeded {startup_timeout} seconds; "
+                        "increase startup_timeout and check the ComfyUI console.")
+                self.config, self.profile = config, profile
+            except BaseException:
+                # load_model can fail after constructing the vision handler.
+                storage.clean(all=True)
+                self.llm = self.storage = self.module = None
+                self.config = self.profile = None
                 raise
 
     def complete(self, task, prompt, images, seed, timeout,
@@ -788,45 +779,52 @@ class LocalServer:
         return translated, result.get("usage", {})
 
     def _post_completion(self, payload, timeout):
-        """Wait for llama.cpp while honoring ComfyUI's interrupt flag."""
-        request = Request(f"http://127.0.0.1:{self.port}/v1/chat/completions",
-                          data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                          headers={"Content-Type": "application/json"}, method="POST")
-        outcome = {}
+        """Call the installed plugin's model without a server or HTTP transport."""
+        with self.lock:
+            if (self.llm is None or self.storage.llm is not self.llm
+                    or self.storage.current_config != self.config):
+                raise RuntimeError("The PE model was unloaded/replaced; run PE Rewrite again.")
+            deadline = time.monotonic() + timeout
 
-        def perform():
-            try:
-                with LOCAL_OPENER.open(request, timeout=timeout) as response:
-                    outcome["result"] = json.load(response)
-            except HTTPError as exc:
-                detail = exc.read(2000).decode("utf-8", "replace")
-                outcome["error"] = RuntimeError(f"llama-server HTTP {exc.code}: {detail}")
-            except BaseException as exc:
-                outcome["error"] = exc
-
-        try:
-            import comfy.model_management as memory
-            check_interrupt = memory.throw_exception_if_processing_interrupted
-        except ImportError:
-            check_interrupt = None
-        worker = threading.Thread(target=perform, name="qwen-pe-http", daemon=True)
-        worker.start()
-        deadline = time.monotonic() + timeout
-        try:
-            while worker.is_alive():
-                worker.join(0.25)
-                if check_interrupt:
-                    check_interrupt()
+            def guard(_tokens=None, scores=None):
+                check_interrupt()
                 if time.monotonic() > deadline:
-                    raise TimeoutError(f"llama-server generation exceeded {timeout} seconds")
-        except BaseException:
-            self.stop()
-            worker.join(5)
-            raise
-        if "error" in outcome:
-            raise outcome["error"]
-        return outcome["result"]
+                    raise TimeoutError(f"Native generation exceeded {timeout} seconds")
+                return scores
+
+            kwargs = dict(payload)
+            template_args = kwargs.pop("chat_template_kwargs", {})
+            kwargs.pop("model", None)
+            # The plugin's JamePeng binding calls this present_penalty.
+            if "presence_penalty" in kwargs:
+                kwargs["present_penalty"] = kwargs.pop("presence_penalty")
+            handler = self.storage.chat_handler
+            thinking = template_args.get("enable_thinking", True)
+            old_thinking = handler.enable_thinking
+            old_template_thinking = handler.extra_template_arguments["enable_thinking"]
+            try:
+                guard()
+                self.storage.ensure_embedding_mode(False)
+                handler.enable_thinking = thinking
+                handler.extra_template_arguments["enable_thinking"] = thinking
+                self.llm.reset()
+                kwargs["logits_processor"] = self.module.llama_cpp.LogitsProcessorList([guard])
+                result = self.llm.create_chat_completion(**kwargs)
+                guard()
+                # A native thinking template pre-fills <think>, which may not be
+                # present in returned text. Keep JSON inside reasoning invisible.
+                message = result["choices"][0]["message"]
+                content = message.get("content") or ""
+                if thinking and "</think>" in content and not content.lstrip().startswith("<think>"):
+                    message["content"] = "<think>" + content
+                return result
+            except BaseException:
+                self.stop()
+                raise
+            finally:
+                handler.enable_thinking = old_thinking
+                handler.extra_template_arguments["enable_thinking"] = old_template_thinking
 
 
-SERVER = LocalServer()
+SERVER = LocalRuntime()
 atexit.register(SERVER.stop)
